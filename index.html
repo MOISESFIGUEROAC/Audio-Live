@@ -1,0 +1,848 @@
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+
+// --- Custom Hook for Web Audio Logic ---
+function useWebAudio() {
+  const audioContextRef = useRef(null);
+  const sourceNodeRef = useRef(null);
+  const gainNodeRef = useRef(null); // Master gain
+  const eqNodesRef = useRef([]); // Array for EQ BiquadFilterNodes
+  const compressorNodeRef = useRef(null);
+  const delayNodeRef = useRef(null);
+  const feedbackGainNodeRef = useRef(null); // For delay feedback
+  const dryGainNodeRef = useRef(null); // For delay mix (original signal)
+  const wetGainNodeRef = useRef(null); // For delay mix (delayed signal)
+  const analyserNodeRef = useRef(null); // For potential future visualization
+
+  const [isInitialized, setIsInitialized] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [audioBuffer, setAudioBuffer] = useState(null);
+  const [fileName, setFileName] = useState('');
+
+  // --- Effect Parameters State ---
+  const [eqParams, setEqParams] = useState([
+    { type: 'lowshelf', frequency: 300, gain: 0, q: 1, enabled: true }, // Low Shelf
+    { type: 'peaking', frequency: 1000, gain: 0, q: 1, enabled: true }, // Mid Peaking
+    { type: 'highshelf', frequency: 5000, gain: 0, q: 1, enabled: true }, // High Shelf
+  ]);
+  const [compressorParams, setCompressorParams] = useState({
+    threshold: -24, ratio: 12, attack: 0.003, release: 0.25, enabled: true
+  });
+  const [delayParams, setDelayParams] = useState({
+    time: 0.5, feedback: 0.4, mix: 0.5, enabled: true
+  });
+
+  // --- Initialize Audio Context ---
+  const initializeAudio = useCallback(() => {
+    if (!audioContextRef.current) {
+      const context = new (window.AudioContext || window.webkitAudioContext)();
+      audioContextRef.current = context;
+
+      // Create Master Gain
+      gainNodeRef.current = context.createGain();
+      gainNodeRef.current.gain.setValueAtTime(1, context.currentTime);
+
+      // Create EQ Nodes
+      eqNodesRef.current = eqParams.map(param => {
+        const node = context.createBiquadFilter();
+        node.type = param.type;
+        node.frequency.setValueAtTime(param.frequency, context.currentTime);
+        node.gain.setValueAtTime(param.gain, context.currentTime);
+        node.Q.setValueAtTime(param.q, context.currentTime);
+        return node;
+      });
+
+      // Create Compressor Node
+      compressorNodeRef.current = context.createDynamicsCompressor();
+      compressorNodeRef.current.threshold.setValueAtTime(compressorParams.threshold, context.currentTime);
+      compressorNodeRef.current.ratio.setValueAtTime(compressorParams.ratio, context.currentTime);
+      compressorNodeRef.current.attack.setValueAtTime(compressorParams.attack, context.currentTime);
+      compressorNodeRef.current.release.setValueAtTime(compressorParams.release, context.currentTime);
+
+      // Create Delay Nodes
+      delayNodeRef.current = context.createDelay(5.0); // Max delay time 5s
+      delayNodeRef.current.delayTime.setValueAtTime(delayParams.time, context.currentTime);
+      feedbackGainNodeRef.current = context.createGain();
+      feedbackGainNodeRef.current.gain.setValueAtTime(delayParams.feedback, context.currentTime);
+      dryGainNodeRef.current = context.createGain();
+      wetGainNodeRef.current = context.createGain();
+      dryGainNodeRef.current.gain.setValueAtTime(1 - delayParams.mix, context.currentTime);
+      wetGainNodeRef.current.gain.setValueAtTime(delayParams.mix, context.currentTime);
+
+      // Create Analyser Node (for future use)
+      analyserNodeRef.current = context.createAnalyser();
+
+      // Connect Delay Loop
+      delayNodeRef.current.connect(feedbackGainNodeRef.current);
+      feedbackGainNodeRef.current.connect(delayNodeRef.current);
+
+      // Connect Wet/Dry for Delay
+      delayNodeRef.current.connect(wetGainNodeRef.current);
+
+      setIsInitialized(true);
+      console.log("AudioContext Initialized");
+    }
+  }, [eqParams, compressorParams, delayParams]); // Dependencies ensure nodes are created with initial state
+
+  // --- Connect Audio Nodes ---
+  const connectNodes = useCallback(() => {
+    if (!isInitialized || !sourceNodeRef.current) return;
+
+    const context = audioContextRef.current;
+    let lastNode = sourceNodeRef.current;
+
+    // Connect EQ Nodes in series if enabled
+    eqNodesRef.current.forEach((node, index) => {
+      if (eqParams[index].enabled) {
+        lastNode.disconnect(); // Disconnect previous connection
+        lastNode.connect(node);
+        lastNode = node;
+      } else {
+         // If disabled, attempt to disconnect it if it was the last connected node
+         // This bypass logic is simplified; a more robust approach might use dedicated bypass GainNodes
+         try { lastNode.disconnect(node); } catch (e) { /* ignore if not connected */ }
+      }
+    });
+
+    // Connect Compressor if enabled
+    if (compressorParams.enabled) {
+      lastNode.disconnect();
+      lastNode.connect(compressorNodeRef.current);
+      lastNode = compressorNodeRef.current;
+    } else {
+       try { lastNode.disconnect(compressorNodeRef.current); } catch (e) { /* ignore */ }
+    }
+
+    // Connect Delay if enabled (using wet/dry mix)
+    if (delayParams.enabled) {
+      lastNode.disconnect(); // Disconnect from final output path temporarily
+      // Connect to both dry path and delay input
+      lastNode.connect(dryGainNodeRef.current);
+      lastNode.connect(delayNodeRef.current); // Input to the delay line
+
+      // Connect dry and wet paths to the master gain
+      dryGainNodeRef.current.connect(gainNodeRef.current);
+      wetGainNodeRef.current.connect(gainNodeRef.current);
+    } else {
+      // If delay is disabled, connect the last effect directly to master gain
+      lastNode.disconnect();
+      lastNode.connect(gainNodeRef.current);
+       // Ensure wet/dry are disconnected from master gain if they were connected
+       try { dryGainNodeRef.current.disconnect(gainNodeRef.current); } catch(e) {/* ignore */}
+       try { wetGainNodeRef.current.disconnect(gainNodeRef.current); } catch(e) {/* ignore */}
+    }
+
+     // If NO effects are enabled after source, connect source directly
+    if (lastNode === sourceNodeRef.current && !delayParams.enabled) {
+         sourceNodeRef.current.disconnect();
+         sourceNodeRef.current.connect(gainNodeRef.current);
+    }
+
+
+    // Final connection to destination (speakers) and analyser
+    gainNodeRef.current.connect(analyserNodeRef.current);
+    analyserNodeRef.current.connect(context.destination);
+
+    console.log("Audio nodes connected/reconnected");
+
+  }, [isInitialized, eqParams, compressorParams, delayParams]); // Reconnect if effect states change
+
+  // --- Load Audio File ---
+  const loadAudioFile = useCallback(async (file) => {
+    if (!file) return;
+    initializeAudio(); // Ensure context is ready
+    const context = audioContextRef.current;
+    if (!context) return;
+
+    setFileName(file.name);
+    const reader = new FileReader();
+
+    reader.onload = async (e) => {
+      try {
+        const buffer = await context.decodeAudioData(e.target.result);
+        setAudioBuffer(buffer);
+        console.log("Audio file decoded successfully");
+        // Stop any previous playback
+        if (sourceNodeRef.current) {
+          sourceNodeRef.current.stop();
+          sourceNodeRef.current.disconnect();
+        }
+        setIsPlaying(false);
+      } catch (error) {
+        console.error("Error decoding audio data:", error);
+        alert(`Error decoding audio file: ${error.message}`);
+        setFileName('');
+        setAudioBuffer(null);
+      }
+    };
+
+    reader.onerror = (e) => {
+      console.error("FileReader error:", e);
+      alert("Error reading file.");
+      setFileName('');
+      setAudioBuffer(null);
+    };
+
+    reader.readAsArrayBuffer(file);
+  }, [initializeAudio]);
+
+  // --- Playback Controls ---
+  const play = useCallback(() => {
+    if (!audioBuffer || isPlaying || !isInitialized) return;
+    const context = audioContextRef.current;
+
+    // Stop and disconnect previous source if it exists
+    if (sourceNodeRef.current) {
+        try { sourceNodeRef.current.stop(); } catch(e) {}
+        sourceNodeRef.current.disconnect();
+    }
+
+
+    // Create a new source node for playback
+    sourceNodeRef.current = context.createBufferSource();
+    sourceNodeRef.current.buffer = audioBuffer;
+
+    // Connect nodes *before* starting playback
+    connectNodes();
+
+    sourceNodeRef.current.onended = () => {
+      setIsPlaying(false);
+      // Optionally disconnect source here, or wait until next play/load
+      console.log("Playback ended");
+    };
+
+    sourceNodeRef.current.start(0);
+    setIsPlaying(true);
+    // Ensure context is running (important after inactivity or page load)
+    if (context.state === 'suspended') {
+        context.resume();
+    }
+    console.log("Playback started");
+  }, [audioBuffer, isPlaying, isInitialized, connectNodes]);
+
+  const pause = useCallback(() => {
+    if (!isPlaying || !isInitialized) return;
+    const context = audioContextRef.current;
+    context.suspend().then(() => {
+      setIsPlaying(false);
+      console.log("Playback paused (context suspended)");
+    });
+  }, [isPlaying, isInitialized]);
+
+  const resume = useCallback(() => {
+     if (isPlaying || !isInitialized || !audioBuffer) return; // Resume only if paused
+     const context = audioContextRef.current;
+     context.resume().then(() => {
+         // Check if source still exists and hasn't finished
+         if (sourceNodeRef.current) {
+            setIsPlaying(true);
+             console.log("Playback resumed (context resumed)");
+         } else {
+             // If source finished while paused, allow playing again
+             setIsPlaying(false);
+             console.log("Context resumed, but playback had finished. Ready to play again.");
+         }
+     });
+  }, [isPlaying, isInitialized, audioBuffer]);
+
+
+  const stop = useCallback(() => {
+    if (!isInitialized) return;
+     // Stop the source node if it exists and is playing
+    if (sourceNodeRef.current && isPlaying) {
+        try {
+            sourceNodeRef.current.stop(0); // Stop immediately
+            sourceNodeRef.current.disconnect(); // Disconnect it
+            sourceNodeRef.current = null; // Release reference
+        } catch(e) {
+            console.warn("Error stopping source node:", e);
+        }
+    }
+    // Reset playback state regardless
+    setIsPlaying(false);
+    // Reset context time? Usually not needed unless precise seeking is implemented.
+    console.log("Playback stopped");
+  }, [isInitialized, isPlaying]);
+
+
+  // --- Update Effect Parameters ---
+  const updateEqParam = useCallback((index, param, value) => {
+    setEqParams(prevParams => {
+      const newParams = [...prevParams];
+      newParams[index] = { ...newParams[index], [param]: value };
+      // Update Web Audio Node immediately
+      if (isInitialized && eqNodesRef.current[index]) {
+        const node = eqNodesRef.current[index];
+        const context = audioContextRef.current;
+        if (param === 'frequency') {
+          node.frequency.linearRampToValueAtTime(value, context.currentTime + 0.01);
+        } else if (param === 'gain') {
+          node.gain.linearRampToValueAtTime(value, context.currentTime + 0.01);
+        } else if (param === 'q') {
+          node.Q.linearRampToValueAtTime(value, context.currentTime + 0.01);
+        } else if (param === 'enabled') {
+           // Reconnect nodes when enabled status changes
+           connectNodes();
+        }
+      }
+      return newParams;
+    });
+  }, [isInitialized, connectNodes]); // connectNodes dependency for enabled toggle
+
+  const updateCompressorParam = useCallback((param, value) => {
+    setCompressorParams(prevParams => {
+      const newParams = { ...prevParams, [param]: value };
+      // Update Web Audio Node immediately
+      if (isInitialized && compressorNodeRef.current) {
+        const node = compressorNodeRef.current;
+        const context = audioContextRef.current;
+        if (param === 'threshold') {
+          node.threshold.linearRampToValueAtTime(value, context.currentTime + 0.01);
+        } else if (param === 'ratio') {
+          node.ratio.linearRampToValueAtTime(value, context.currentTime + 0.01);
+        } else if (param === 'attack') {
+          node.attack.linearRampToValueAtTime(value, context.currentTime + 0.01);
+        } else if (param === 'release') {
+          node.release.linearRampToValueAtTime(value, context.currentTime + 0.01);
+        } else if (param === 'enabled') {
+            // Reconnect nodes when enabled status changes
+            connectNodes();
+        }
+      }
+      return newParams;
+    });
+  }, [isInitialized, connectNodes]); // connectNodes dependency for enabled toggle
+
+  const updateDelayParam = useCallback((param, value) => {
+    setDelayParams(prevParams => {
+      const newParams = { ...prevParams, [param]: value };
+      // Update Web Audio Node immediately
+      if (isInitialized && delayNodeRef.current) {
+        const context = audioContextRef.current;
+        if (param === 'time') {
+          delayNodeRef.current.delayTime.linearRampToValueAtTime(value, context.currentTime + 0.01);
+        } else if (param === 'feedback') {
+          feedbackGainNodeRef.current.gain.linearRampToValueAtTime(value, context.currentTime + 0.01);
+        } else if (param === 'mix') {
+          dryGainNodeRef.current.gain.linearRampToValueAtTime(1 - value, context.currentTime + 0.01);
+          wetGainNodeRef.current.gain.linearRampToValueAtTime(value, context.currentTime + 0.01);
+        } else if (param === 'enabled') {
+            // Reconnect nodes when enabled status changes
+            connectNodes();
+        }
+      }
+      return newParams;
+    });
+  }, [isInitialized, connectNodes]); // connectNodes dependency for enabled toggle
+
+
+   // --- Effect to handle node reconnections when enabled states change ---
+   // This useEffect specifically listens for changes in the enabled flags
+   // and triggers connectNodes. This is slightly redundant with the callbacks above
+   // but provides an extra layer of safety.
+   useEffect(() => {
+    if (isInitialized) {
+        console.log("Effect params enabled flags changed, reconnecting nodes.");
+        connectNodes();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [
+        eqParams.map(p => p.enabled).join(','), // Create dependencies from enabled flags
+        compressorParams.enabled,
+        delayParams.enabled,
+        connectNodes, // Include connectNodes itself
+        isInitialized
+    ]);
+
+
+  // --- Cleanup ---
+  useEffect(() => {
+    // Function to clean up audio resources
+    const cleanup = () => {
+      if (sourceNodeRef.current) {
+        try { sourceNodeRef.current.stop(); } catch(e) {}
+        sourceNodeRef.current.disconnect();
+        sourceNodeRef.current = null;
+      }
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        audioContextRef.current.close().then(() => {
+          console.log("AudioContext closed");
+        });
+        audioContextRef.current = null;
+      }
+       // Explicitly disconnect all nodes to be safe
+      gainNodeRef.current?.disconnect();
+      eqNodesRef.current.forEach(node => node?.disconnect());
+      compressorNodeRef.current?.disconnect();
+      delayNodeRef.current?.disconnect();
+      feedbackGainNodeRef.current?.disconnect();
+      dryGainNodeRef.current?.disconnect();
+      wetGainNodeRef.current?.disconnect();
+      analyserNodeRef.current?.disconnect();
+
+    };
+
+    // Return the cleanup function to be called on unmount
+    return cleanup;
+  }, []); // Empty dependency array ensures this runs only on unmount
+
+  return {
+    isInitialized,
+    isPlaying,
+    audioBuffer,
+    fileName,
+    eqParams,
+    compressorParams,
+    delayParams,
+    loadAudioFile,
+    play,
+    pause,
+    resume,
+    stop,
+    updateEqParam,
+    updateCompressorParam,
+    updateDelayParam,
+    initializeAudio // Expose initialize function for user interaction start
+  };
+}
+
+
+// --- UI Components ---
+
+// Reusable Slider Component
+function Slider({ label, min, max, step, value, onChange, unit = '', neonColor = 'cyan' }) {
+  const neonClasses = {
+    cyan: 'accent-cyan-400',
+    magenta: 'accent-magenta-400',
+    yellow: 'accent-yellow-400',
+  };
+  const borderClasses = {
+    cyan: 'border-cyan-400',
+    magenta: 'border-magenta-400',
+    yellow: 'border-yellow-400',
+  }
+
+  return (
+    <div className="flex flex-col space-y-1 text-xs">
+      <label className="flex justify-between items-center text-gray-400">
+        <span>{label}</span>
+        <span className={`font-mono text-${neonColor}-400`}>{Number(value).toFixed(label === 'Ratio' ? 1 : 2)}{unit}</span>
+      </label>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className={`w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer ${neonClasses[neonColor]} transition-colors duration-150`}
+      />
+    </div>
+  );
+}
+
+// Reusable Toggle Switch Component
+function Toggle({ label, enabled, onChange, neonColor = 'cyan' }) {
+   const bgClass = enabled ? `bg-${neonColor}-500` : 'bg-gray-600';
+   const translateClass = enabled ? 'translate-x-4' : 'translate-x-0';
+
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-sm font-medium text-gray-300">{label}</span>
+      <button
+        onClick={() => onChange(!enabled)}
+        className={`${bgClass} relative inline-flex items-center h-5 rounded-full w-9 transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 focus:ring-${neonColor}-500`}
+        aria-pressed={enabled}
+      >
+        <span className="sr-only">Use setting</span>
+        <span
+          className={`${translateClass} inline-block w-4 h-4 transform bg-white rounded-full transition-transform duration-200 ease-in-out`}
+        />
+      </button>
+    </div>
+  );
+}
+
+
+// Effect Module Component
+function EffectModule({ title, children, enabled, onToggle, neonColor = 'cyan' }) {
+  const borderClass = `border-${neonColor}-500`;
+  const textClass = `text-${neonColor}-400`;
+
+  return (
+    <div className={`bg-gray-800 border ${enabled ? borderClass : 'border-gray-700'} rounded-lg p-3 transition-colors duration-200`}>
+      <div className="flex justify-between items-center mb-3 pb-2 border-b border-gray-700">
+        <h3 className={`text-sm font-semibold uppercase tracking-wider ${enabled ? textClass : 'text-gray-500'}`}>{title}</h3>
+        <Toggle label="" enabled={enabled} onChange={onToggle} neonColor={neonColor} />
+      </div>
+      <div className={`space-y-3 ${!enabled ? 'opacity-50 pointer-events-none' : ''}`}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// File Upload Component
+function AudioUpload({ onLoad, fileName, onInitialize }) {
+  const [dragging, setDragging] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const handleDragEnter = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragging(true);
+  };
+
+  const handleDragLeave = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragging(false);
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation(); // Necessary to allow drop
+     setDragging(true); // Keep dragging true while over
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragging(false);
+     // Initialize audio context on first user interaction (drop)
+    onInitialize();
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0) {
+      if (files[0].type.startsWith('audio/')) {
+        onLoad(files[0]);
+      } else {
+        alert('Por favor, sube un archivo de audio válido (MP3, WAV, OGG, etc.).');
+      }
+      // Clear the data transfer buffer
+      e.dataTransfer.clearData();
+    }
+  };
+
+  const handleFileChange = (e) => {
+     // Initialize audio context on first user interaction (file select)
+    onInitialize();
+    const file = e.target.files[0];
+    if (file && file.type.startsWith('audio/')) {
+      onLoad(file);
+    } else if (file) {
+       alert('Por favor, sube un archivo de audio válido (MP3, WAV, OGG, etc.).');
+    }
+  };
+
+  const handleClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  return (
+    <div
+      className={`relative border-2 ${dragging ? 'border-cyan-400 bg-gray-700' : 'border-dashed border-gray-600'} rounded-lg p-6 text-center cursor-pointer hover:border-gray-500 transition-colors duration-200`}
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+      onClick={handleClick} // Trigger file input click
+    >
+      <input
+        type="file"
+        accept="audio/*"
+        ref={fileInputRef}
+        onChange={handleFileChange}
+        className="hidden" // Hide the default input
+        aria-label="Subir archivo de audio"
+      />
+      <div className="flex flex-col items-center justify-center space-y-2 text-gray-400">
+         {/* Placeholder Icon - Replace with a proper SVG icon if desired */}
+         <svg xmlns="http://www.w3.org/2000/svg" className="h-10 w-10 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+         </svg>
+        {fileName ? (
+           <>
+            <p className="text-sm font-medium text-cyan-400 truncate max-w-full px-4">{fileName}</p>
+            <p className="text-xs">Arrastra otro archivo o haz clic para reemplazar</p>
+           </>
+        ) : (
+          <>
+            <p className="text-sm font-medium">Arrastra y suelta un archivo de audio aquí</p>
+            <p className="text-xs">o haz clic para seleccionar</p>
+          </>
+        )}
+        {dragging && (
+          <p className="text-xs text-cyan-400 absolute bottom-2 left-0 right-0">¡Suelta el archivo!</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+// Player Controls Component
+function PlayerControls({ onPlay, onPause, onResume, onStop, isPlaying, isInitialized, hasBuffer }) {
+    const canPlay = isInitialized && hasBuffer && !isPlaying;
+    const canPause = isInitialized && isPlaying;
+    const canStop = isInitialized && hasBuffer; // Can stop if buffer loaded, even if paused
+
+    // Determine which button to show: Play or Resume
+    const showPlay = !isPlaying;
+    const playOrResumeAction = isPlaying ? onPause : (audioContextRef.current?.state === 'suspended' ? onResume : onPlay);
+    const playOrResumeLabel = isPlaying ? 'Pause' : (audioContextRef.current?.state === 'suspended' ? 'Resume' : 'Play');
+    const playOrResumeDisabled = isPlaying ? !canPause : !canPlay && audioContextRef.current?.state !== 'suspended';
+
+
+  return (
+    <div className="flex items-center justify-center space-x-4 bg-gray-800 p-3 rounded-lg">
+       {/* Play/Pause/Resume Button */}
+      <button
+        onClick={playOrResumeAction}
+        disabled={playOrResumeDisabled}
+        className={`px-4 py-2 rounded-md text-sm font-medium transition-colors duration-150 flex items-center justify-center ${
+          playOrResumeDisabled
+            ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+            : 'bg-cyan-500 hover:bg-cyan-600 text-white'
+        }`}
+        aria-label={playOrResumeLabel}
+      >
+        {isPlaying ? (
+           // Pause Icon
+           <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+             <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
+           </svg>
+        ) : (
+           // Play Icon
+           <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+             <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
+           </svg>
+        )}
+         <span className="ml-2">{playOrResumeLabel}</span>
+      </button>
+
+       {/* Stop Button */}
+      <button
+        onClick={onStop}
+        disabled={!canStop}
+        className={`px-4 py-2 rounded-md text-sm font-medium transition-colors duration-150 flex items-center justify-center ${
+          !canStop
+            ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+            : 'bg-red-500 hover:bg-red-600 text-white'
+        }`}
+        aria-label="Stop"
+      >
+         {/* Stop Icon */}
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 8a2 2 0 012-2h0a2 2 0 012 2v4a2 2 0 01-2 2h0a2 2 0 01-2-2V8z" clipRule="evenodd" />
+        </svg>
+         <span className="ml-2">Stop</span>
+      </button>
+    </div>
+  );
+}
+
+
+// --- Main App Component ---
+function App() {
+  const {
+    isInitialized,
+    isPlaying,
+    audioBuffer,
+    fileName,
+    eqParams,
+    compressorParams,
+    delayParams,
+    loadAudioFile,
+    play,
+    pause,
+    resume,
+    stop,
+    updateEqParam,
+    updateCompressorParam,
+    updateDelayParam,
+    initializeAudio // Get the initialize function
+  } = useWebAudio();
+
+  const handleFileLoad = (file) => {
+    // No need to call initializeAudio here, AudioUpload handles it on interaction
+    loadAudioFile(file);
+  };
+
+  // Handle potential need to initialize AudioContext on user interaction
+  // if no file has been dropped/selected yet.
+  const ensureAudioContext = () => {
+    if (!isInitialized) {
+      console.log("Initializing AudioContext via button click (fallback).");
+      initializeAudio();
+    }
+  };
+
+  const handlePlay = () => {
+      ensureAudioContext(); // Ensure context is ready before playing
+      play();
+  }
+   const handleResume = () => {
+      ensureAudioContext(); // Ensure context is ready before resuming
+      resume();
+  }
+
+
+  return (
+    <div className="min-h-screen bg-gray-900 text-gray-200 font-sans p-4 md:p-8">
+      <div className="max-w-4xl mx-auto space-y-6">
+        {/* Header */}
+        <header className="text-center mb-8">
+          <h1 className="text-3xl font-bold text-cyan-400 tracking-tight">Audio Processor</h1>
+          <p className="text-sm text-gray-500">Carga audio y aplica efectos en tiempo real</p>
+        </header>
+
+        {/* File Upload Section */}
+        <section aria-labelledby="upload-heading">
+            <h2 id="upload-heading" className="sr-only">Cargar archivo de audio</h2>
+            <AudioUpload
+                onLoad={handleFileLoad}
+                fileName={fileName}
+                onInitialize={initializeAudio} // Pass initializer for user interaction start
+            />
+            {!isInitialized && (
+                <p className="text-xs text-yellow-400 text-center mt-2">
+                    Haz clic o arrastra un archivo para activar el audio.
+                </p>
+            )}
+        </section>
+
+
+        {/* Player Controls Section */}
+        {audioBuffer && (
+          <section aria-labelledby="player-heading">
+             <h2 id="player-heading" className="sr-only">Controles de reproducción</h2>
+            <PlayerControls
+              onPlay={handlePlay} // Use wrapped play
+              onPause={pause}
+              onResume={handleResume} // Use wrapped resume
+              onStop={stop}
+              isPlaying={isPlaying}
+              isInitialized={isInitialized}
+              hasBuffer={!!audioBuffer}
+            />
+          </section>
+        )}
+
+        {/* Effects Rack Section */}
+        {isInitialized && ( // Show effects only after context is initialized
+          <section aria-labelledby="effects-heading">
+            <h2 id="effects-heading" className="text-lg font-semibold text-gray-400 mb-4 text-center uppercase tracking-wider">Rack de Efectos</h2>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+
+              {/* EQ Module */}
+              <EffectModule
+                title="Equalizer"
+                enabled={eqParams.some(p => p.enabled)} // Consider module enabled if any band is
+                onToggle={(enable) => eqParams.forEach((_, i) => updateEqParam(i, 'enabled', enable))} // Toggle all bands
+                neonColor="cyan"
+              >
+                {eqParams.map((param, index) => (
+                  <div key={index} className={`border-t ${index > 0 ? 'mt-3 pt-3 border-gray-700' : 'border-transparent'}`}>
+                     <Toggle
+                        label={`${param.type === 'lowshelf' ? 'Low' : param.type === 'highshelf' ? 'High' : 'Mid'} (${param.frequency} Hz)`}
+                        enabled={param.enabled}
+                        onChange={(val) => updateEqParam(index, 'enabled', val)}
+                        neonColor="cyan"
+                     />
+                     <Slider
+                        label="Gain"
+                        min={-24} max={24} step={0.1}
+                        value={param.gain}
+                        onChange={(val) => updateEqParam(index, 'gain', val)}
+                        unit=" dB"
+                        neonColor="cyan"
+                     />
+                     {/* Optionally add Frequency/Q controls here */}
+                  </div>
+                ))}
+              </EffectModule>
+
+              {/* Compressor Module */}
+              <EffectModule
+                title="Compressor"
+                enabled={compressorParams.enabled}
+                onToggle={(val) => updateCompressorParam('enabled', val)}
+                neonColor="magenta"
+              >
+                <Slider
+                  label="Threshold"
+                  min={-100} max={0} step={1}
+                  value={compressorParams.threshold}
+                  onChange={(val) => updateCompressorParam('threshold', val)}
+                  unit=" dB"
+                  neonColor="magenta"
+                />
+                <Slider
+                  label="Ratio"
+                  min={1} max={20} step={0.1}
+                  value={compressorParams.ratio}
+                  onChange={(val) => updateCompressorParam('ratio', val)}
+                  unit=":1"
+                  neonColor="magenta"
+                />
+                 <Slider
+                  label="Attack"
+                  min={0.001} max={0.2} step={0.001}
+                  value={compressorParams.attack}
+                  onChange={(val) => updateCompressorParam('attack', val)}
+                  unit=" s"
+                  neonColor="magenta"
+                />
+                 <Slider
+                  label="Release"
+                  min={0.01} max={1} step={0.01}
+                  value={compressorParams.release}
+                  onChange={(val) => updateCompressorParam('release', val)}
+                  unit=" s"
+                  neonColor="magenta"
+                />
+              </EffectModule>
+
+              {/* Delay Module */}
+              <EffectModule
+                title="Delay"
+                enabled={delayParams.enabled}
+                onToggle={(val) => updateDelayParam('enabled', val)}
+                neonColor="yellow"
+              >
+                <Slider
+                  label="Time"
+                  min={0.01} max={2.0} step={0.01} // Max time limited for sanity
+                  value={delayParams.time}
+                  onChange={(val) => updateDelayParam('time', val)}
+                  unit=" s"
+                  neonColor="yellow"
+                />
+                <Slider
+                  label="Feedback"
+                  min={0} max={0.95} step={0.01} // Avoid >1 feedback
+                  value={delayParams.feedback}
+                  onChange={(val) => updateDelayParam('feedback', val)}
+                  neonColor="yellow"
+                />
+                <Slider
+                  label="Mix (Wet)"
+                  min={0} max={1} step={0.01}
+                  value={delayParams.mix}
+                  onChange={(val) => updateDelayParam('mix', val)}
+                  neonColor="yellow"
+                />
+              </EffectModule>
+
+            </div>
+          </section>
+        )}
+      </div>
+       {/* Footer/Info */}
+        <footer className="text-center mt-12 text-xs text-gray-600">
+            Web Audio API Demo | React + TailwindCSS
+        </footer>
+    </div>
+  );
+}
+
+export default App;
